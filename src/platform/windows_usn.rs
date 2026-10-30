@@ -460,7 +460,10 @@ fn parse_record_buffer(bytes: &[u8]) -> Result<Vec<JournalRecord>, String> {
                 .try_into()
                 .map_err(|_| "Invalid USN record length".to_owned())?,
         ) as usize;
-        if record_length < USN_V2_HEADER_SIZE || record_length > bytes.len() - offset {
+        if record_length < USN_V2_HEADER_SIZE
+            || !record_length.is_multiple_of(8)
+            || record_length > bytes.len() - offset
+        {
             return Err("USN data returned an invalid record length".to_owned());
         }
         records.push(parse_v2_record(&bytes[offset..offset + record_length])?);
@@ -503,8 +506,17 @@ fn parse_v2_record(bytes: &[u8]) -> Result<JournalRecord, String> {
         )
     };
 
-    if read_u16(4) != 2 {
-        return Err(format!("Unsupported USN record version {}", read_u16(4)));
+    let declared_length = read_u32(0) as usize;
+    if declared_length != bytes.len() {
+        return Err("USN record length does not match its buffer bounds".to_owned());
+    }
+
+    let major_version = read_u16(4);
+    let minor_version = read_u16(6);
+    if major_version != 2 || minor_version != 0 {
+        return Err(format!(
+            "Unsupported USN record version {major_version}.{minor_version}"
+        ));
     }
 
     let name_length = read_u16(56) as usize;
@@ -513,7 +525,10 @@ fn parse_v2_record(bytes: &[u8]) -> Result<JournalRecord, String> {
         .checked_add(name_length)
         .filter(|end| *end <= bytes.len())
         .ok_or_else(|| "USN record has an invalid filename range".to_owned())?;
-    if !name_length.is_multiple_of(2) || name_offset < USN_V2_HEADER_SIZE {
+    if !name_length.is_multiple_of(2)
+        || !name_offset.is_multiple_of(2)
+        || name_offset < USN_V2_HEADER_SIZE
+    {
         return Err("USN record has an invalid UTF-16 filename".to_owned());
     }
     let (name_units, _) = bytes[name_offset..name_end].as_chunks::<2>();
@@ -545,7 +560,8 @@ mod tests {
             .iter()
             .flat_map(|unit| unit.to_ne_bytes())
             .collect::<Vec<_>>();
-        let mut bytes = vec![0; USN_V2_HEADER_SIZE + name_bytes.len()];
+        let record_length = (USN_V2_HEADER_SIZE + name_bytes.len()).next_multiple_of(8);
+        let mut bytes = vec![0; record_length];
         let record_length = bytes.len() as u32;
         bytes[0..4].copy_from_slice(&record_length.to_ne_bytes());
         bytes[4..6].copy_from_slice(&version.to_ne_bytes());
@@ -556,7 +572,8 @@ mod tests {
         bytes[52..56].copy_from_slice(&ATTRIBUTE_DIRECTORY.to_ne_bytes());
         bytes[56..58].copy_from_slice(&(name_bytes.len() as u16).to_ne_bytes());
         bytes[58..60].copy_from_slice(&(USN_V2_HEADER_SIZE as u16).to_ne_bytes());
-        bytes[USN_V2_HEADER_SIZE..].copy_from_slice(&name_bytes);
+        bytes[USN_V2_HEADER_SIZE..USN_V2_HEADER_SIZE + name_bytes.len()]
+            .copy_from_slice(&name_bytes);
         bytes
     }
 
@@ -579,6 +596,10 @@ mod tests {
     fn rejects_unsupported_versions_and_invalid_filename_ranges() {
         assert!(parse_v2_record(&encoded_record(3, &[b'x' as u16])).is_err());
 
+        let mut unsupported_minor = encoded_record(2, &[b'x' as u16]);
+        unsupported_minor[6..8].copy_from_slice(&1u16.to_ne_bytes());
+        assert!(parse_v2_record(&unsupported_minor).is_err());
+
         let mut invalid = encoded_record(2, &[b'x' as u16]);
         invalid[58..60].copy_from_slice(&u16::MAX.to_ne_bytes());
         assert!(parse_v2_record(&invalid).is_err());
@@ -591,5 +612,11 @@ mod tests {
         let mut invalid = vec![0; 12];
         invalid[0..4].copy_from_slice(&100u32.to_ne_bytes());
         assert!(parse_record_buffer(&invalid).is_err());
+
+        let mut unaligned = encoded_record(2, &[b'x' as u16]);
+        unaligned.pop();
+        let record_length = (unaligned.len() as u32).to_ne_bytes();
+        unaligned[0..4].copy_from_slice(&record_length);
+        assert!(parse_record_buffer(&unaligned).is_err());
     }
 }

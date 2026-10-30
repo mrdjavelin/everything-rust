@@ -98,9 +98,9 @@ fn reindex(connection: &mut rusqlite::Connection) -> bool {
 
 fn main() {
     let db_path = database::get_database_path().expect("Failed to determine database path");
+    let db_path = db_path.to_str().expect("Invalid database path").to_owned();
 
-    let mut connection = database::open_database(db_path.to_str().expect("Invalid database path"))
-        .expect("Failed to open database");
+    let mut connection = database::open_database(&db_path).expect("Failed to open database");
     let roots = get_scan_roots();
 
     if roots.is_empty() {
@@ -114,7 +114,17 @@ fn main() {
         println!("  {}", root.display());
     }
 
-    reindex(&mut connection);
+    let sync_path = db_path.clone();
+    let mut sync_task = Some(std::thread::spawn(move || {
+        let mut connection = match database::open_database(&sync_path) {
+            Ok(connection) => connection,
+            Err(error) => {
+                eprintln!("Background synchronization could not open the database: {error}");
+                return false;
+            }
+        };
+        reindex(&mut connection)
+    }));
 
     let mut input = String::new();
 
@@ -138,6 +148,14 @@ fn main() {
         }
 
         if query.eq_ignore_ascii_case(":reindex") {
+            if sync_task.as_ref().is_some_and(|task| !task.is_finished()) {
+                eprintln!("Waiting for the initial synchronization before reindexing.");
+            }
+            if let Some(task) = sync_task.take() {
+                if task.join().is_err() {
+                    eprintln!("Background synchronization thread panicked.");
+                }
+            }
             reindex(&mut connection);
             continue;
         }
