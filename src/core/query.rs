@@ -1,4 +1,4 @@
-use crate::entry::EntryKind;
+use super::EntryKind;
 
 pub struct SearchQuery {
     pub text: String,

@@ -1,4 +1,6 @@
-use rusqlite::{Connection, Result};
+use std::path::Path;
+
+use rusqlite::{Connection, OptionalExtension, Result};
 
 pub fn get_database_path() -> std::io::Result<std::path::PathBuf> {
     let home = if cfg!(windows) {
@@ -17,7 +19,7 @@ pub fn get_database_path() -> std::io::Result<std::path::PathBuf> {
     Ok(std::path::PathBuf::from(home).join(".everything-rust.db"))
 }
 
-pub fn open_database(path: &str) -> Result<Connection> {
+pub fn open_database(path: impl AsRef<Path>) -> Result<Connection> {
     let connection = Connection::open(path)?;
     connection.pragma_update(None, "journal_mode", "WAL")?;
     connection.pragma_update(None, "synchronous", "NORMAL")?;
@@ -113,6 +115,14 @@ pub(super) fn initialize_database(connection: &Connection) -> Result<()> {
             PRIMARY KEY (volume_id, file_reference)
         );
 
+        CREATE TABLE IF NOT EXISTS volume_rebuild (
+            volume_id TEXT PRIMARY KEY,
+            root_path TEXT NOT NULL,
+            journal_id TEXT NOT NULL,
+            next_usn INTEGER NOT NULL,
+            next_file_reference TEXT NOT NULL
+        );
+
         CREATE INDEX IF NOT EXISTS entries_name_nocase_idx
             ON entries(name COLLATE NOCASE);
         CREATE INDEX IF NOT EXISTS entries_kind_name_idx
@@ -122,10 +132,92 @@ pub(super) fn initialize_database(connection: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS volume_sync_root_idx
             ON volume_sync(root_path);
         CREATE INDEX IF NOT EXISTS ntfs_files_parent_idx
-            ON ntfs_files(volume_id, parent_reference);
-        CREATE INDEX IF NOT EXISTS ntfs_staging_parent_idx
-            ON ntfs_staging(volume_id, parent_reference);",
+            ON ntfs_files(volume_id, parent_reference);",
     )?;
+
+    let search_index_version: Option<String> = connection
+        .query_row(
+            "SELECT value FROM metadata WHERE key = 'entries_fts_version'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+
+    if search_index_version.as_deref() != Some("1") {
+        let transaction = connection.unchecked_transaction()?;
+        transaction.execute_batch(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS entries_fts
+                USING fts5(name, normalized_path, tokenize = 'trigram case_sensitive 1');
+
+            CREATE TRIGGER IF NOT EXISTS entries_fts_insert
+            AFTER INSERT ON entries BEGIN
+                INSERT INTO entries_fts(rowid, name, normalized_path)
+                VALUES (
+                    new.rowid,
+                    lower(new.name),
+                    lower(replace(new.path, char(92), '/'))
+                );
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS entries_fts_delete
+            AFTER DELETE ON entries BEGIN
+                DELETE FROM entries_fts WHERE rowid = old.rowid;
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS entries_fts_update
+            AFTER UPDATE OF path, name ON entries BEGIN
+                DELETE FROM entries_fts WHERE rowid = old.rowid;
+                INSERT INTO entries_fts(rowid, name, normalized_path)
+                VALUES (
+                    new.rowid,
+                    lower(new.name),
+                    lower(replace(new.path, char(92), '/'))
+                );
+            END;
+
+            INSERT INTO entries_fts(entries_fts) VALUES ('rebuild');",
+        )?;
+        transaction.execute(
+            "INSERT INTO metadata (key, value)
+             VALUES ('entries_fts_version', '1')
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [],
+        )?;
+        transaction.commit()?;
+    }
+
+    let update_trigger_version: Option<String> = connection
+        .query_row(
+            "SELECT value FROM metadata WHERE key = 'entries_fts_update_guard_version'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if update_trigger_version.as_deref() != Some("1") {
+        let transaction = connection.unchecked_transaction()?;
+        transaction.execute_batch(
+            "DROP TRIGGER IF EXISTS entries_fts_update;
+
+            CREATE TRIGGER entries_fts_update
+            AFTER UPDATE OF path, name ON entries
+            WHEN old.path IS NOT new.path OR old.name IS NOT new.name BEGIN
+                DELETE FROM entries_fts WHERE rowid = old.rowid;
+                INSERT INTO entries_fts(rowid, name, normalized_path)
+                VALUES (
+                    new.rowid,
+                    lower(new.name),
+                    lower(replace(new.path, char(92), '/'))
+                );
+            END;",
+        )?;
+        transaction.execute(
+            "INSERT INTO metadata (key, value)
+             VALUES ('entries_fts_update_guard_version', '1')
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [],
+        )?;
+        transaction.commit()?;
+    }
 
     Ok(())
 }

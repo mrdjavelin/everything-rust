@@ -4,11 +4,46 @@ use crate::journal::{
 };
 use rusqlite::{Connection, OptionalExtension, Result};
 
+const RESOLVE_MFT_QUERY: &str = "
+    WITH RECURSIVE resolved(
+        file_reference, parent_reference, name, path, kind, size, visited, depth
+    ) AS (
+        SELECT file_reference, parent_reference, name, ?2, kind, size,
+               '/' || file_reference || '/', 0
+        FROM ntfs_staging
+        WHERE volume_id = ?1 AND file_reference = parent_reference
+        UNION ALL
+        SELECT child.file_reference, child.parent_reference, child.name,
+               resolved.path ||
+               CASE WHEN substr(resolved.path, -1) = char(92) THEN '' ELSE char(92) END ||
+               child.name,
+               child.kind, child.size,
+               resolved.visited || child.file_reference || '/',
+               resolved.depth + 1
+        FROM resolved
+        CROSS JOIN ntfs_staging child
+        WHERE child.volume_id = ?1
+          AND child.parent_reference = resolved.file_reference
+          AND child.file_reference != child.parent_reference
+          AND resolved.depth < 4096
+          AND instr(resolved.visited, '/' || child.file_reference || '/') = 0
+    )
+    SELECT file_reference, parent_reference, name, path, kind, size
+    FROM resolved";
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VolumeSyncState {
     pub journal_id: String,
     pub next_usn: i64,
     pub root_path: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VolumeRebuildCheckpoint {
+    pub root_path: String,
+    pub journal_id: String,
+    pub next_usn: i64,
+    pub next_file_reference: String,
 }
 
 pub fn load_volume_sync_state(
@@ -32,8 +67,67 @@ pub fn load_volume_sync_state(
 }
 
 pub fn begin_volume_rebuild(connection: &Connection, volume_id: &str) -> Result<()> {
-    connection.execute("DELETE FROM ntfs_staging WHERE volume_id = ?1", [volume_id])?;
+    let transaction = connection.unchecked_transaction()?;
+    transaction.execute("DELETE FROM ntfs_staging WHERE volume_id = ?1", [volume_id])?;
+    transaction.execute(
+        "DELETE FROM volume_rebuild WHERE volume_id = ?1",
+        [volume_id],
+    )?;
+    transaction.execute_batch(
+        "CREATE INDEX IF NOT EXISTS ntfs_staging_parent_idx
+         ON ntfs_staging(volume_id, parent_reference)",
+    )?;
+    transaction.commit()?;
     Ok(())
+}
+
+pub fn load_volume_rebuild_checkpoint(
+    connection: &Connection,
+    volume_id: &str,
+) -> Result<Option<VolumeRebuildCheckpoint>> {
+    connection
+        .query_row(
+            "SELECT root_path, journal_id, next_usn, next_file_reference
+             FROM volume_rebuild WHERE volume_id = ?1",
+            [volume_id],
+            |row| {
+                Ok(VolumeRebuildCheckpoint {
+                    root_path: row.get(0)?,
+                    journal_id: row.get(1)?,
+                    next_usn: row.get(2)?,
+                    next_file_reference: row.get(3)?,
+                })
+            },
+        )
+        .optional()
+}
+
+pub fn start_volume_rebuild(
+    connection: &mut Connection,
+    volume_id: &str,
+    root_path: &str,
+    journal_id: &str,
+    next_usn: i64,
+) -> Result<()> {
+    let transaction = connection.transaction()?;
+    transaction.execute("DELETE FROM ntfs_staging WHERE volume_id = ?1", [volume_id])?;
+    transaction.execute(
+        "INSERT INTO volume_rebuild (
+            volume_id, root_path, journal_id, next_usn, next_file_reference
+         ) VALUES (?1, ?2, ?3, ?4, '0')
+         ON CONFLICT(volume_id) DO UPDATE SET
+            root_path = excluded.root_path,
+            journal_id = excluded.journal_id,
+            next_usn = excluded.next_usn,
+            next_file_reference = excluded.next_file_reference",
+        rusqlite::params![volume_id, root_path, journal_id, next_usn],
+    )?;
+    transaction.execute_batch("DROP INDEX IF EXISTS ntfs_staging_parent_idx")?;
+    transaction.commit()
+}
+
+pub fn resume_volume_rebuild(connection: &mut Connection) -> Result<()> {
+    connection.execute_batch("DROP INDEX IF EXISTS ntfs_staging_parent_idx")
 }
 
 pub fn invalidate_volume_sync_for_root(
@@ -53,12 +147,18 @@ pub fn invalidate_volume_sync_for_root(
         [&*root_path],
     )?;
     transaction.execute(
+        "DELETE FROM volume_rebuild
+         WHERE volume_id IN (SELECT volume_id FROM volume_sync WHERE root_path = ?1)",
+        [&*root_path],
+    )?;
+    transaction.execute(
         "DELETE FROM volume_sync WHERE root_path = ?1",
         [&*root_path],
     )?;
     transaction.commit()
 }
 
+#[cfg(test)]
 pub fn stage_mft_records(
     connection: &mut Connection,
     volume_id: &str,
@@ -89,46 +189,65 @@ pub fn stage_mft_records(
     transaction.commit()
 }
 
+pub fn stage_mft_page(
+    connection: &mut Connection,
+    volume_id: &str,
+    records: &[JournalRecord],
+    next_file_reference: u64,
+) -> Result<()> {
+    let transaction = connection.transaction()?;
+    {
+        let mut statement = transaction.prepare_cached(
+            "INSERT INTO ntfs_staging (
+                volume_id, file_reference, parent_reference, name, kind, size
+            ) VALUES (?1, ?2, ?3, ?4, ?5, NULL)",
+        )?;
+
+        for record in records {
+            statement.execute(rusqlite::params![
+                volume_id,
+                record.file_reference_number.to_string(),
+                record.parent_file_reference_number.to_string(),
+                record.name,
+                i64::from(record.attributes & ATTRIBUTE_DIRECTORY != 0)
+            ])?;
+        }
+    }
+    let checkpoint_updated = transaction.execute(
+        "UPDATE volume_rebuild SET next_file_reference = ?2 WHERE volume_id = ?1",
+        rusqlite::params![volume_id, next_file_reference.to_string()],
+    )?;
+    if checkpoint_updated != 1 {
+        return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "MFT page has no persisted rebuild checkpoint",
+            ),
+        )));
+    }
+    transaction.commit()
+}
+
 pub fn finish_volume_rebuild(
     connection: &mut Connection,
     volume_id: &str,
     root_path: &str,
     journal_id: &str,
     next_usn: i64,
-) -> Result<()> {
+) -> Result<usize> {
     let transaction = connection.transaction()?;
     let root_prefix = if root_path.ends_with(['\\', '/']) {
         root_path.to_owned()
     } else {
         format!("{root_path}\\")
     };
+    transaction.execute_batch(
+        "CREATE INDEX IF NOT EXISTS ntfs_staging_parent_idx
+         ON ntfs_staging(volume_id, parent_reference)",
+    )?;
     transaction.execute_batch("DROP TABLE IF EXISTS temp.usn_resolved;")?;
     transaction.execute(
-        "CREATE TEMP TABLE usn_resolved AS
-         WITH RECURSIVE resolved(
-             file_reference, parent_reference, name, path, kind, size, visited, depth
-         ) AS (
-             SELECT file_reference, parent_reference, name, ?2, kind, size,
-                    '/' || file_reference || '/', 0
-             FROM ntfs_staging
-             WHERE volume_id = ?1 AND file_reference = parent_reference
-             UNION ALL
-             SELECT child.file_reference, child.parent_reference, child.name,
-                    resolved.path ||
-                    CASE WHEN substr(resolved.path, -1) = char(92) THEN '' ELSE char(92) END ||
-                    child.name,
-                    child.kind, child.size,
-                    resolved.visited || child.file_reference || '/',
-                    resolved.depth + 1
-             FROM ntfs_staging child
-             JOIN resolved ON child.parent_reference = resolved.file_reference
-             WHERE child.volume_id = ?1
-               AND child.file_reference != child.parent_reference
-               AND resolved.depth < 4096
-               AND instr(resolved.visited, '/' || child.file_reference || '/') = 0
-         )
-         SELECT file_reference, parent_reference, name, path, kind, size
-         FROM resolved",
+        &format!("CREATE TEMP TABLE usn_resolved AS {RESOLVE_MFT_QUERY}"),
         rusqlite::params![volume_id, root_path],
     )?;
 
@@ -139,9 +258,26 @@ pub fn finish_volume_rebuild(
     )?;
     let resolved_count: i64 =
         transaction.query_row("SELECT COUNT(*) FROM usn_resolved", [], |row| row.get(0))?;
-    if staging_count == 0 || staging_count != resolved_count {
-        return Err(rusqlite::Error::InvalidQuery);
+    let root_count: i64 = transaction.query_row(
+        "SELECT COUNT(*) FROM usn_resolved
+         WHERE file_reference = parent_reference AND path = ?1",
+        [root_path],
+        |row| row.get(0),
+    )?;
+    if staging_count == 0 || root_count != 1 || resolved_count > staging_count {
+        return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "MFT path resolution failed: {staging_count} records staged, \
+                     {resolved_count} resolved, {root_count} volume roots found"
+                ),
+            ),
+        )));
     }
+    let skipped_records = usize::try_from(staging_count - resolved_count).map_err(|error| {
+        rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(error)))
+    })?;
 
     transaction.execute(
         "DELETE FROM ntfs_files
@@ -202,8 +338,13 @@ pub fn finish_volume_rebuild(
         rusqlite::params![volume_id, journal_id, next_usn, root_path],
     )?;
     transaction.execute("DELETE FROM ntfs_staging WHERE volume_id = ?1", [volume_id])?;
+    transaction.execute(
+        "DELETE FROM volume_rebuild WHERE volume_id = ?1",
+        [volume_id],
+    )?;
     transaction.execute_batch("DROP TABLE temp.usn_resolved;")?;
-    transaction.commit()
+    transaction.commit()?;
+    Ok(skipped_records)
 }
 
 pub fn apply_usn_batch(

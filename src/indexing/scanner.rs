@@ -1,19 +1,29 @@
+//! Bounded-batch recursive filesystem scanner.
+
 use std::{fs, path::Path};
 
-use crate::entry::{EntryKind, FsEntry};
+use crate::core::{EntryKind, FsEntry};
 
-const BATCH_SIZE: usize = 512;
+const BATCH_SIZE: usize = 4096;
 
+#[derive(Debug, PartialEq, Eq)]
 pub struct ScanSummary {
     pub discovered: usize,
     pub skipped: usize,
     pub complete: bool,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum ScanError<E> {
+    Cancelled,
+    Save(E),
+}
+
 pub fn scan_root<E>(
     root: &Path,
+    mut should_cancel: impl FnMut() -> bool,
     mut save_batch: impl FnMut(&[FsEntry]) -> Result<(), E>,
-) -> Result<ScanSummary, E> {
+) -> Result<ScanSummary, ScanError<E>> {
     let mut summary = ScanSummary {
         discovered: 0,
         skipped: 0,
@@ -23,6 +33,9 @@ pub fn scan_root<E>(
     let mut directories = vec![root.to_path_buf()];
 
     while let Some(directory) = directories.pop() {
+        if should_cancel() {
+            return Err(ScanError::Cancelled);
+        }
         let entries = match fs::read_dir(&directory) {
             Ok(entries) => entries,
             Err(_) => {
@@ -33,6 +46,9 @@ pub fn scan_root<E>(
         };
 
         for entry in entries {
+            if should_cancel() {
+                return Err(ScanError::Cancelled);
+            }
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(_) => {
@@ -89,14 +105,14 @@ pub fn scan_root<E>(
             summary.discovered += 1;
 
             if pending.len() == BATCH_SIZE {
-                save_batch(&pending)?;
+                save_batch(&pending).map_err(ScanError::Save)?;
                 pending.clear();
             }
         }
     }
 
     if !pending.is_empty() {
-        save_batch(&pending)?;
+        save_batch(&pending).map_err(ScanError::Save)?;
     }
 
     Ok(summary)
@@ -125,12 +141,16 @@ mod tests {
 
         let mut batch_count = 0;
         let mut discovered = Vec::new();
-        let result = scan_root(&root, |batch| {
-            assert!(batch.len() <= BATCH_SIZE);
-            batch_count += 1;
-            discovered.extend(batch.iter().map(|entry| entry.name.clone()));
-            Ok::<_, ()>(())
-        })
+        let result = scan_root(
+            &root,
+            || false,
+            |batch| {
+                assert!(batch.len() <= BATCH_SIZE);
+                batch_count += 1;
+                discovered.extend(batch.iter().map(|entry| entry.name.clone()));
+                Ok::<_, ()>(())
+            },
+        )
         .unwrap();
 
         fs::remove_dir_all(&root).unwrap();
@@ -144,9 +164,19 @@ mod tests {
 
     #[test]
     fn inaccessible_root_is_reported_as_incomplete() {
-        let summary =
-            scan_root::<()>(Path::new("missing-directory-for-indexer-test"), |_| Ok(())).unwrap();
+        let summary = scan_root::<()>(
+            Path::new("missing-directory-for-indexer-test"),
+            || false,
+            |_| Ok(()),
+        )
+        .unwrap();
         assert!(!summary.complete);
         assert_eq!(summary.skipped, 1);
+    }
+
+    #[test]
+    fn scan_stops_when_shutdown_is_requested() {
+        let result = scan_root::<()>(Path::new("."), || true, |_| Ok(()));
+        assert_eq!(result, Err(ScanError::Cancelled));
     }
 }

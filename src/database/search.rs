@@ -1,10 +1,10 @@
 use std::path::PathBuf;
 
-use crate::entry::{EntryKind, FsEntry};
+use crate::core::{EntryKind, FsEntry};
 use rusqlite::{Connection, Result, types::Value};
 
 pub fn search_entries(connection: &Connection, query: &str) -> Result<Vec<FsEntry>> {
-    use crate::search::parse_query;
+    use crate::core::parse_query;
 
     let parsed = parse_query(query);
     let text = parsed.text.replace('\\', "/");
@@ -38,22 +38,43 @@ pub fn search_entries(connection: &Connection, query: &str) -> Result<Vec<FsEntr
     }
 
     if let Some(extension) = parsed.extension {
-        let extension = escape_like(&extension.to_lowercase());
+        let extension = extension.to_lowercase();
+        let extension = escape_like(&extension);
 
         sql.push_str(" AND name LIKE ? ESCAPE '!'");
         params.push(Value::Text(format!("%.{}", extension)));
+        let extension_phrase = format!(".{}", extension.replace('"', "\"\""));
+        if extension_phrase.chars().count() >= 3 {
+            sql.push_str(
+                " AND rowid IN (
+                    SELECT rowid FROM entries_fts
+                    WHERE entries_fts MATCH ?
+                )",
+            );
+            params.push(Value::Text(format!("\"{extension_phrase}\"")));
+        }
     }
 
     if !text.is_empty() {
-        sql.push_str(
-            " AND (
-                name LIKE ? ESCAPE '!'
-                OR LOWER(REPLACE(path, char(92), '/')) LIKE ? ESCAPE '!'
-            )",
-        );
-
-        params.push(Value::Text(contains_pattern.clone()));
-        params.push(Value::Text(contains_pattern.clone()));
+        if text.chars().count() >= 3 {
+            let phrase = format!("\"{}\"", text.replace('"', "\"\""));
+            sql.push_str(
+                " AND rowid IN (
+                    SELECT rowid FROM entries_fts
+                    WHERE entries_fts MATCH ?
+                )",
+            );
+            params.push(Value::Text(phrase));
+        } else {
+            sql.push_str(
+                " AND (
+                    name LIKE ? ESCAPE '!'
+                    OR LOWER(REPLACE(path, char(92), '/')) LIKE ? ESCAPE '!'
+                )",
+            );
+            params.push(Value::Text(contains_pattern.clone()));
+            params.push(Value::Text(contains_pattern.clone()));
+        }
 
         sql.push_str(
             " ORDER BY

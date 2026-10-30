@@ -18,13 +18,7 @@ use windows::{
     core::HSTRING,
 };
 
-use crate::{
-    database::{
-        VolumeSyncState, apply_usn_batch, begin_volume_rebuild, finish_volume_rebuild,
-        load_volume_sync_state, stage_mft_records,
-    },
-    journal::JournalRecord,
-};
+use crate::journal::JournalRecord;
 
 const GENERIC_READ: u32 = 0x8000_0000;
 const ENUM_BUFFER_SIZE: usize = 1024 * 1024;
@@ -171,12 +165,13 @@ impl Volume {
         Ok((next_usn, records))
     }
 
-    pub fn enumerate_mft(
+    pub fn enumerate_mft_from(
         &self,
-        mut visit: impl FnMut(JournalRecord) -> Result<(), String>,
+        start_file_reference_number: u64,
+        mut visit_page: impl FnMut(Vec<JournalRecord>, u64) -> Result<(), String>,
     ) -> Result<(), String> {
         let mut query = MFT_ENUM_DATA_V0 {
-            StartFileReferenceNumber: 0,
+            StartFileReferenceNumber: start_file_reference_number,
             LowUsn: 0,
             HighUsn: i64::MAX,
         };
@@ -221,16 +216,17 @@ impl Volume {
                 if next_reference <= query.StartFileReferenceNumber {
                     return Ok(());
                 }
+                visit_page(Vec::new(), next_reference)?;
                 query.StartFileReferenceNumber = next_reference;
                 continue;
             }
-            for record in parse_record_buffer(&buffer[ENUM_HEADER_SIZE..used])? {
-                visit(record)?;
-            }
-
             if next_reference <= query.StartFileReferenceNumber {
                 return Err("MFT enumeration cursor did not advance".to_owned());
             }
+            visit_page(
+                parse_record_buffer(&buffer[ENUM_HEADER_SIZE..used])?,
+                next_reference,
+            )?;
             query.StartFileReferenceNumber = next_reference;
         }
     }
@@ -280,174 +276,6 @@ pub fn identify_volume(root: &Path) -> windows::core::Result<VolumeIdentity> {
     })
 }
 
-pub fn sync_volume(connection: &mut rusqlite::Connection, root: &Path) -> Result<(), String> {
-    let identity = identify_volume(root)
-        .map_err(|error| format!("Could not identify {}: {error}", root.display()))?;
-    if !identity.file_system.eq_ignore_ascii_case("NTFS") {
-        return Err(format!(
-            "{} uses {}, not NTFS",
-            root.display(),
-            identity.file_system
-        ));
-    }
-
-    let volume = Volume::open(root)
-        .map_err(|error| format!("Could not open {} for USN access: {error}", root.display()))?;
-    let root_path = root.to_string_lossy().into_owned();
-    let mut rebuilt = false;
-
-    loop {
-        let journal = volume
-            .query_journal()
-            .map_err(|error| format!("Could not query the USN journal: {error}"))?;
-        let state = load_volume_sync_state(connection, &identity.id)
-            .map_err(|error| format!("Could not load volume state: {error}"))?;
-
-        if !state
-            .as_ref()
-            .is_some_and(|state| is_valid_state(state, &root_path, journal))
-        {
-            if rebuilt {
-                return Err("The USN journal changed repeatedly during resynchronization".into());
-            }
-            rebuild_volume(connection, &volume, &identity.id, &root_path, journal)?;
-            rebuilt = true;
-            continue;
-        }
-
-        let state = state.expect("validated volume state");
-        let mut cursor = state.next_usn;
-        loop {
-            let current = volume
-                .query_journal()
-                .map_err(|error| format!("Could not refresh USN journal metadata: {error}"))?;
-            if state.journal_id != current.journal_id.to_string()
-                || state.root_path != root_path
-                || cursor < current.lowest_valid_usn
-                || cursor < current.first_usn
-                || cursor > current.next_usn
-            {
-                if rebuilt {
-                    return Err(
-                        "The USN journal was reset or truncated during synchronization".into(),
-                    );
-                }
-                rebuild_volume(connection, &volume, &identity.id, &root_path, current)?;
-                rebuilt = true;
-                break;
-            }
-            if cursor == current.next_usn {
-                return Ok(());
-            }
-
-            let (next_usn, records) = match volume.read_journal(cursor, current.journal_id) {
-                Ok(batch) => batch,
-                Err(error) => {
-                    let refreshed = volume.query_journal().map_err(|query_error| {
-                        format!("{error}; metadata query failed: {query_error}")
-                    })?;
-                    if rebuilt
-                        || state.journal_id == refreshed.journal_id.to_string()
-                            && state.root_path == root_path
-                            && cursor >= refreshed.lowest_valid_usn
-                            && cursor >= refreshed.first_usn
-                            && cursor <= refreshed.next_usn
-                    {
-                        return Err(error);
-                    }
-                    rebuild_volume(connection, &volume, &identity.id, &root_path, refreshed)?;
-                    rebuilt = true;
-                    break;
-                }
-            };
-            if next_usn < cursor {
-                return Err("USN journal returned an invalid cursor".into());
-            }
-            if next_usn == cursor && records.is_empty() {
-                return Err("USN journal made no progress before its current end".into());
-            }
-            apply_usn_batch(
-                connection,
-                &identity.id,
-                &root_path,
-                &current.journal_id.to_string(),
-                cursor,
-                next_usn,
-                &records,
-            )
-            .map_err(|error| format!("Could not apply USN changes: {error}"))?;
-            cursor = next_usn;
-        }
-    }
-}
-
-fn is_valid_state(state: &VolumeSyncState, root_path: &str, journal: JournalInfo) -> bool {
-    state.journal_id == journal.journal_id.to_string()
-        && state.root_path == root_path
-        && state.next_usn >= 0
-        && state.next_usn >= journal.lowest_valid_usn
-        && state.next_usn >= journal.first_usn
-        && state.next_usn <= journal.next_usn
-}
-
-fn rebuild_volume(
-    connection: &mut rusqlite::Connection,
-    volume: &Volume,
-    volume_id: &str,
-    root_path: &str,
-    starting_journal: JournalInfo,
-) -> Result<(), String> {
-    begin_volume_rebuild(connection, volume_id)
-        .map_err(|error| format!("Could not prepare MFT resynchronization: {error}"))?;
-
-    let mut batch = Vec::with_capacity(512);
-    let enumeration_result = volume.enumerate_mft(|record| {
-        batch.push(record);
-        if batch.len() >= 512 {
-            stage_mft_records(connection, volume_id, &batch)
-                .map_err(|error| format!("Could not stage MFT entries: {error}"))?;
-            batch.clear();
-        }
-        Ok(())
-    });
-    if let Err(error) = enumeration_result {
-        return match begin_volume_rebuild(connection, volume_id) {
-            Ok(()) => Err(format!("MFT enumeration failed: {error}")),
-            Err(cleanup_error) => Err(format!(
-                "MFT enumeration failed: {error}; staging cleanup failed: {cleanup_error}"
-            )),
-        };
-    }
-    if !batch.is_empty() {
-        stage_mft_records(connection, volume_id, &batch)
-            .map_err(|error| format!("Could not stage final MFT batch: {error}"))?;
-    }
-
-    let latest = volume
-        .query_journal()
-        .map_err(|error| format!("Could not verify journal after MFT enumeration: {error}"))?;
-    if latest.journal_id != starting_journal.journal_id
-        || starting_journal.next_usn < latest.lowest_valid_usn
-        || starting_journal.next_usn < latest.first_usn
-    {
-        return match begin_volume_rebuild(connection, volume_id) {
-            Ok(()) => Err("The journal changed or truncated during MFT enumeration".into()),
-            Err(error) => Err(format!(
-                "The journal changed during MFT enumeration; staging cleanup failed: {error}"
-            )),
-        };
-    }
-
-    finish_volume_rebuild(
-        connection,
-        volume_id,
-        root_path,
-        &starting_journal.journal_id.to_string(),
-        starting_journal.next_usn,
-    )
-    .map_err(|error| format!("Could not commit the MFT index: {error}"))
-}
-
 fn parse_record_buffer(bytes: &[u8]) -> Result<Vec<JournalRecord>, String> {
     let mut records = Vec::new();
     let mut offset = 0;
@@ -477,50 +305,21 @@ fn parse_v2_record(bytes: &[u8]) -> Result<JournalRecord, String> {
         return Err("USN record is shorter than its fixed header".to_owned());
     }
 
-    let read_u16 = |offset: usize| {
-        u16::from_ne_bytes(
-            bytes[offset..offset + 2]
-                .try_into()
-                .expect("checked record bounds"),
-        )
-    };
-    let read_u32 = |offset: usize| {
-        u32::from_ne_bytes(
-            bytes[offset..offset + 4]
-                .try_into()
-                .expect("checked record bounds"),
-        )
-    };
-    let read_u64 = |offset: usize| {
-        u64::from_ne_bytes(
-            bytes[offset..offset + 8]
-                .try_into()
-                .expect("checked record bounds"),
-        )
-    };
-    let read_i64 = |offset: usize| {
-        i64::from_ne_bytes(
-            bytes[offset..offset + 8]
-                .try_into()
-                .expect("checked record bounds"),
-        )
-    };
-
-    let declared_length = read_u32(0) as usize;
+    let declared_length = u32::from_ne_bytes(read_record_field(bytes, 0)?) as usize;
     if declared_length != bytes.len() {
         return Err("USN record length does not match its buffer bounds".to_owned());
     }
 
-    let major_version = read_u16(4);
-    let minor_version = read_u16(6);
+    let major_version = u16::from_ne_bytes(read_record_field(bytes, 4)?);
+    let minor_version = u16::from_ne_bytes(read_record_field(bytes, 6)?);
     if major_version != 2 || minor_version != 0 {
         return Err(format!(
             "Unsupported USN record version {major_version}.{minor_version}"
         ));
     }
 
-    let name_length = read_u16(56) as usize;
-    let name_offset = read_u16(58) as usize;
+    let name_length = u16::from_ne_bytes(read_record_field(bytes, 56)?) as usize;
+    let name_offset = u16::from_ne_bytes(read_record_field(bytes, 58)?) as usize;
     let name_end = name_offset
         .checked_add(name_length)
         .filter(|end| *end <= bytes.len())
@@ -541,13 +340,25 @@ fn parse_v2_record(bytes: &[u8]) -> Result<JournalRecord, String> {
     .map_err(|_| "USN record filename is not valid UTF-16".to_owned())?;
 
     Ok(JournalRecord {
-        file_reference_number: read_u64(8),
-        parent_file_reference_number: read_u64(16),
-        usn: read_i64(24),
-        reason: read_u32(40),
-        attributes: read_u32(52),
+        file_reference_number: u64::from_ne_bytes(read_record_field(bytes, 8)?),
+        parent_file_reference_number: u64::from_ne_bytes(read_record_field(bytes, 16)?),
+        usn: i64::from_ne_bytes(read_record_field(bytes, 24)?),
+        reason: u32::from_ne_bytes(read_record_field(bytes, 40)?),
+        attributes: u32::from_ne_bytes(read_record_field(bytes, 52)?),
         name,
     })
+}
+
+fn read_record_field<const N: usize>(bytes: &[u8], offset: usize) -> Result<[u8; N], String> {
+    let end = offset
+        .checked_add(N)
+        .filter(|end| *end <= bytes.len())
+        .ok_or_else(|| "USN record has a truncated fixed field".to_owned())?;
+    bytes
+        .get(offset..end)
+        .ok_or_else(|| "USN record has a truncated fixed field".to_owned())?
+        .try_into()
+        .map_err(|_| "USN record has an invalid fixed field".to_owned())
 }
 
 #[cfg(test)]

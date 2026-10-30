@@ -1,6 +1,6 @@
+use crate::core::{EntryKind, FsEntry};
 use crate::database::schema::initialize_database;
 use crate::database::*;
-use crate::entry::{EntryKind, FsEntry};
 use crate::journal::{
     ATTRIBUTE_DIRECTORY, JournalRecord, REASON_FILE_DELETE, REASON_RENAME_NEW_NAME,
     REASON_RENAME_OLD_NAME,
@@ -167,6 +167,45 @@ fn incomplete_fallback_scan_keeps_unseen_entries() {
 }
 
 #[test]
+fn completed_fallback_scan_is_persisted_and_partial_scan_invalidates_it() {
+    let mut connection = test_connection();
+    let root = PathBuf::from(r"D:\");
+
+    let scan_id = begin_scanned_root(&mut connection).unwrap();
+    finish_scanned_root(&mut connection, &root, scan_id, true).unwrap();
+    assert!(has_completed_fallback_scan(&connection, &root).unwrap());
+
+    let partial_scan_id = begin_scanned_root(&mut connection).unwrap();
+    finish_scanned_root(&mut connection, &root, partial_scan_id, false).unwrap();
+    assert!(!has_completed_fallback_scan(&connection, &root).unwrap());
+}
+
+#[cfg(unix)]
+#[test]
+fn complete_unix_fallback_scan_removes_unseen_entries() {
+    let mut connection = test_connection();
+    let root = PathBuf::from("/tmp/everything-rust-unix-scan-root");
+    let entry = FsEntry {
+        name: "stale.txt".to_owned(),
+        path: root.join("stale.txt"),
+        kind: EntryKind::File,
+        size: Some(5),
+        item_count: None,
+    };
+
+    let scan_id = begin_scanned_root(&mut connection).unwrap();
+    save_scanned_batch(&mut connection, scan_id, &[entry]).unwrap();
+    finish_scanned_root(&mut connection, &root, scan_id, true).unwrap();
+
+    let empty_scan_id = begin_scanned_root(&mut connection).unwrap();
+    finish_scanned_root(&mut connection, &root, empty_scan_id, true).unwrap();
+    assert!(!path_for(
+        &connection,
+        "/tmp/everything-rust-unix-scan-root/stale.txt"
+    ));
+}
+
+#[test]
 fn existing_database_schema_is_migrated() {
     let connection = Connection::open_in_memory().unwrap();
     connection
@@ -199,12 +238,13 @@ fn existing_database_schema_is_migrated() {
     let table_count: i64 = connection
         .query_row(
             "SELECT COUNT(*) FROM sqlite_master
-                 WHERE type = 'table' AND name IN ('volume_sync', 'ntfs_files', 'ntfs_staging')",
+                 WHERE type = 'table'
+                   AND name IN ('volume_sync', 'ntfs_files', 'ntfs_staging', 'volume_rebuild')",
             [],
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(table_count, 3);
+    assert_eq!(table_count, 4);
 }
 
 #[test]
@@ -259,6 +299,57 @@ fn search_combines_filters_and_treats_like_metacharacters_literally() {
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].name, "Report%.TXT");
     assert!(matches!(results[0].kind, EntryKind::File));
+
+    let extension_results = search_entries(&connection, "*.txt #file").unwrap();
+    assert_eq!(extension_results.len(), 2);
+}
+
+#[test]
+fn trigram_search_finds_substrings_and_tracks_entry_updates() {
+    let mut connection = test_connection();
+    let path = PathBuf::from(r"C:\docs\secret-folder\Report%.TXT");
+    let entry = FsEntry {
+        name: "Report%.TXT".to_owned(),
+        path: path.clone(),
+        kind: EntryKind::File,
+        size: Some(12),
+        item_count: None,
+    };
+    let scan_id = begin_scanned_root(&mut connection).unwrap();
+    save_scanned_batch(&mut connection, scan_id, &[entry]).unwrap();
+
+    let results = search_entries(&connection, "port%.").unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].name, "Report%.TXT");
+
+    let results = search_entries(&connection, "secret-folder").unwrap();
+    assert_eq!(results.len(), 1);
+
+    connection
+        .execute(
+            "UPDATE entries SET name = 'renamed-report.txt',
+             path = 'C:\\docs\\secret-folder\\renamed-report.txt'
+             WHERE path = ?1",
+            [path.to_string_lossy().as_ref()],
+        )
+        .unwrap_or_else(|error| panic!("updating the entry failed: {error:?}"));
+    assert!(search_entries(&connection, "port%.").unwrap().is_empty());
+    assert_eq!(
+        search_entries(&connection, "renamed-report").unwrap().len(),
+        1
+    );
+
+    connection
+        .execute(
+            "DELETE FROM entries WHERE path = 'C:\\docs\\secret-folder\\renamed-report.txt'",
+            [],
+        )
+        .unwrap();
+    assert!(
+        search_entries(&connection, "renamed-report")
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]
@@ -308,11 +399,24 @@ fn synchronizes_large_directory_in_bounded_batches() {
         )
     }));
 
-    begin_volume_rebuild(&connection, volume_id).unwrap();
+    start_volume_rebuild(&mut connection, volume_id, r"D:\", "journal-1", 50_000).unwrap();
     for batch in records.chunks(512) {
-        stage_mft_records(&mut connection, volume_id, batch).unwrap();
+        let next_reference = batch
+            .last()
+            .map(|record| record.file_reference_number + 1)
+            .unwrap_or(0);
+        stage_mft_page(&mut connection, volume_id, batch, next_reference).unwrap();
     }
     finish_volume_rebuild(&mut connection, volume_id, r"D:\", "journal-1", 50_000).unwrap();
+    let staging_index_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'index' AND name = 'ntfs_staging_parent_idx'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(staging_index_count, 1);
 
     assert_eq!(
         count_for_volume(&connection, "ntfs_files", volume_id),
@@ -320,6 +424,75 @@ fn synchronizes_large_directory_in_bounded_batches() {
     );
     assert_eq!(count_for_volume(&connection, "entries", volume_id), 10_001);
     assert!(path_for(&connection, r"D:\catalog\file-9999.dat"));
+}
+
+#[test]
+fn rebuild_skips_mft_records_without_a_resolvable_parent() {
+    let mut connection = test_connection();
+    let volume_id = "orphan-volume";
+    begin_volume_rebuild(&connection, volume_id).unwrap();
+    stage_mft_records(
+        &mut connection,
+        volume_id,
+        &[
+            record(1, 1, 1, 0, "", ATTRIBUTE_DIRECTORY),
+            record(2, 1, 2, 0, "reachable.txt", 0),
+            record(3, 99, 3, 0, "orphaned.txt", 0),
+        ],
+    )
+    .unwrap();
+
+    let skipped =
+        finish_volume_rebuild(&mut connection, volume_id, r"D:\", "journal-1", 100).unwrap();
+
+    assert_eq!(skipped, 1);
+    assert!(path_for(&connection, r"D:\reachable.txt"));
+    assert!(!path_for(&connection, r"D:\orphaned.txt"));
+    assert_eq!(count_for_volume(&connection, "ntfs_files", volume_id), 2);
+}
+
+#[test]
+fn interrupted_mft_rebuild_resumes_from_persisted_page_cursor() {
+    let mut connection = test_connection();
+    let volume_id = "resumable-volume";
+    let root = r"D:\";
+    start_volume_rebuild(&mut connection, volume_id, root, "journal-7", 100).unwrap();
+    let staging_index_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'index' AND name = 'ntfs_staging_parent_idx'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(staging_index_count, 0);
+    stage_mft_page(
+        &mut connection,
+        volume_id,
+        &[
+            record(1, 1, 1, 0, "", ATTRIBUTE_DIRECTORY),
+            record(2, 1, 2, 0, "saved.txt", 0),
+        ],
+        4096,
+    )
+    .unwrap();
+
+    let checkpoint = load_volume_rebuild_checkpoint(&connection, volume_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(checkpoint.root_path, root);
+    assert_eq!(checkpoint.journal_id, "journal-7");
+    assert_eq!(checkpoint.next_usn, 100);
+    assert_eq!(checkpoint.next_file_reference, "4096");
+    assert_eq!(count_for_volume(&connection, "ntfs_staging", volume_id), 2);
+
+    begin_volume_rebuild(&connection, volume_id).unwrap();
+    assert!(
+        load_volume_rebuild_checkpoint(&connection, volume_id)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(count_for_volume(&connection, "ntfs_staging", volume_id), 0);
 }
 
 #[test]
@@ -371,6 +544,9 @@ fn renaming_directory_updates_all_descendant_paths() {
 
     assert!(!path_for(&connection, r"D:\before\nested\item.txt"));
     assert!(path_for(&connection, r"D:\after\nested\item.txt"));
+    let path_results = search_entries(&connection, "after/nested/item.txt").unwrap();
+    assert_eq!(path_results.len(), 1);
+    assert_eq!(path_results[0].name, "item.txt");
     let indexed_path: String = connection
         .query_row(
             "SELECT path FROM ntfs_files WHERE volume_id = ?1 AND file_reference = '4'",
